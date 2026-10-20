@@ -43,6 +43,20 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
   const [noteTitle, setNoteTitle] = useState('');
   const [noteContent, setNoteContent] = useState('');
 
+  // Sync target folder and reset queue whenever modal opens
+  React.useEffect(() => {
+    if (isOpen) {
+      const targetId =
+        initialFolderId && folders.some((f) => f.id === initialFolderId)
+          ? initialFolderId
+          : (folders[0]?.id ?? '');
+      setSelectedFolderId(targetId);
+      setUploadedQueue([]);
+      setNoteTitle('');
+      setNoteContent('');
+    }
+  }, [isOpen, initialFolderId, folders]);
+
   if (!isOpen) return null;
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -65,6 +79,7 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
   const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       await processFiles(Array.from(e.target.files));
+      e.target.value = '';
     }
   };
 
@@ -99,6 +114,8 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
   const handleSaveUploaded = () => {
     if (uploadedQueue.length === 0) return;
 
+    const targetFolder = selectedFolderId || initialFolderId || (folders.length > 0 ? folders[0].id : '');
+
     const newFiles: UploadedFile[] = uploadedQueue.map((item) => {
       const isAudio = item.file.type.startsWith('audio/');
       const words = item.textContent.split(/\s+/).length;
@@ -113,7 +130,7 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
       return {
         id: `file-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
         name: item.file.name,
-        folderId: selectedFolderId,
+        folderId: targetFolder,
         type,
         size: item.file.size,
         content: item.textContent,
@@ -209,18 +226,23 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
 
           {/* Destination Folder Selector */}
           <div className="flex items-center gap-2 text-xs">
-            <label className="text-slate-400 shrink-0">Folder:</label>
-            <select
-              value={selectedFolderId}
-              onChange={(e) => setSelectedFolderId(e.target.value)}
-              className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 text-xs font-medium cursor-pointer"
-            >
-              {folders.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
-            </select>
+            <span className="text-slate-400 font-semibold shrink-0">Upload to:</span>
+            <div className="relative flex items-center">
+              <select
+                value={selectedFolderId}
+                onChange={(e) => setSelectedFolderId(e.target.value)}
+                className="bg-slate-800 border border-slate-700/80 rounded-lg pl-3 pr-7 py-1.5 text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 text-xs font-semibold cursor-pointer appearance-none shadow-xs"
+              >
+                {folders.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    📁 {f.name}
+                  </option>
+                ))}
+              </select>
+              <div className="absolute right-2 pointer-events-none text-slate-400 text-[9px]">
+                ▼
+              </div>
+            </div>
           </div>
         </div>
 

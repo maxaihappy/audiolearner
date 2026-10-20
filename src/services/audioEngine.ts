@@ -57,6 +57,8 @@ class AudioEngine {
   private currentChunkIndex: number = 0;
   private cachedBrowserVoices: SpeechSynthesisVoice[] = [];
   private onVoicesChangedCallbacks: (() => void)[] = [];
+  private previewAudioElement: HTMLAudioElement | null = null;
+  private previewRequestId: number = 0;
 
   // Listeners
   private onTimeUpdateCallback?: (currentTime: number, duration: number, progress: number) => void;
@@ -402,8 +404,44 @@ class AudioEngine {
     }
   }
 
-  // One-off speech preview for voice testing
-  public async previewVoice(voiceId: string, speed: number = 1.0) {
+  // Stop any active voice preview immediately
+  public stopPreview() {
+    this.previewRequestId++;
+    if (this.previewAudioElement) {
+      try {
+        this.previewAudioElement.pause();
+        this.previewAudioElement.currentTime = 0;
+        this.previewAudioElement.removeAttribute('src');
+        this.previewAudioElement.load();
+      } catch (e) {
+        console.warn('Error unloading preview audio', e);
+      }
+      this.previewAudioElement = null;
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn('Error cancelling speech synthesis', e);
+      }
+    }
+  }
+
+  // One-off speech preview for voice testing (stops any previously playing preview)
+  public async previewVoice(
+    voiceId: string,
+    speed: number = 1.0,
+    onEnded?: () => void
+  ) {
+    // 1. Pause any background document track that was playing
+    this.pause();
+
+    // 2. Stop any existing preview voice completely
+    this.stopPreview();
+
+    this.previewRequestId++;
+    const currentReqId = this.previewRequestId;
+
     if (voiceId.startsWith('gemini-')) {
       const name = voiceId.replace('gemini-', '');
       try {
@@ -411,15 +449,48 @@ class AudioEngine {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            text: `Hello! I am ${name}, your AI voice for AudioLearner. I am ready to read your documents at ${speed}x speed.`,
+            text: `Hello! I am ${name}, your AI voice for AudioLearner. Ready to read at ${speed}x speed.`,
             voiceName: name,
           }),
         });
+
+        // If user switched voices while the server TTS was in-flight, immediately discard
+        if (this.previewRequestId !== currentReqId) {
+          return;
+        }
+
         const data = await response.json();
+        if (this.previewRequestId !== currentReqId) {
+          return;
+        }
+
         if (data.success && data.audioBase64) {
-          const testAudio = new Audio(`data:${data.mimeType || 'audio/wav'};base64,${data.audioBase64}`);
+          const testAudio = new Audio(
+            `data:${data.mimeType || 'audio/wav'};base64,${data.audioBase64}`
+          );
           testAudio.playbackRate = speed;
-          await testAudio.play();
+          this.previewAudioElement = testAudio;
+
+          testAudio.onended = () => {
+            if (this.previewAudioElement === testAudio) {
+              this.previewAudioElement = null;
+            }
+            if (this.previewRequestId === currentReqId && onEnded) onEnded();
+          };
+
+          testAudio.onerror = () => {
+            if (this.previewAudioElement === testAudio) {
+              this.previewAudioElement = null;
+            }
+            if (this.previewRequestId === currentReqId && onEnded) onEnded();
+          };
+
+          try {
+            await testAudio.play();
+          } catch (e) {
+            // Expected if user clicked another voice immediately
+            console.debug('Preview audio playback interrupted by user', e);
+          }
           return;
         }
       } catch (err) {
@@ -427,16 +498,38 @@ class AudioEngine {
       }
     }
 
-    if ('speechSynthesis' in window) {
+    if (this.previewRequestId !== currentReqId) {
+      return;
+    }
+
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
-      const utt = new SpeechSynthesisUtterance(
-        `Hello! This is a test of your selected voice on AudioLearner running at ${speed}x speed.`
-      );
-      utt.rate = speed;
-      const voiceURI = voiceId.replace('browser-', '');
-      const voice = this.cachedBrowserVoices.find(v => v.voiceURI === voiceURI || v.name === voiceURI);
-      if (voice) utt.voice = voice;
-      window.speechSynthesis.speak(utt);
+
+      // Brief tick allows browser speech engine to completely unbind previous utterance
+      setTimeout(() => {
+        if (this.previewRequestId !== currentReqId) {
+          return;
+        }
+
+        const utt = new SpeechSynthesisUtterance(
+          `Hello! This is a test of your selected voice on AudioLearner running at ${speed}x speed.`
+        );
+        utt.rate = speed;
+        const voiceURI = voiceId.replace('browser-', '');
+        const voice = this.cachedBrowserVoices.find(
+          (v) => v.voiceURI === voiceURI || v.name === voiceURI
+        );
+        if (voice) utt.voice = voice;
+
+        utt.onend = () => {
+          if (this.previewRequestId === currentReqId && onEnded) onEnded();
+        };
+        utt.onerror = () => {
+          if (this.previewRequestId === currentReqId && onEnded) onEnded();
+        };
+
+        window.speechSynthesis.speak(utt);
+      }, 50);
     }
   }
 }

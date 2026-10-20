@@ -75,6 +75,8 @@ export default function App() {
   // Cloud Sync status
   const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline'>('synced');
   const lastSyncTimestampRef = useRef<number>(0);
+  const isUploadingRef = useRef<boolean>(false);
+  const lastUploadTimeRef = useRef<number>(0);
 
   // Mobile navigation tab: 'folders' | 'files' | 'queue'
   const [mobileTab, setMobileTab] = useState<'folders' | 'files' | 'queue'>('folders');
@@ -144,22 +146,43 @@ export default function App() {
   // SERVER SYNC (Ensures PC & Mobile Stay in Sync)
   // ==========================================
   const fetchServerData = async (isBackground: boolean = false) => {
+    // If an upload is currently occurring or completed within 2.5s, do not overwrite local state
+    if (isUploadingRef.current || Date.now() - lastUploadTimeRef.current < 2500) {
+      return;
+    }
+
     if (!isBackground) setSyncStatus('syncing');
     try {
       const res = await fetch('/api/data');
       if (res.ok) {
         const data = await res.json();
-        if (data.folders && Array.isArray(data.folders)) {
-          setFolders(data.folders);
-        }
-        if (data.files && Array.isArray(data.files)) {
-          setFiles(data.files);
-        }
-        if (data.playbackSettings && data.playbackSettings.voiceId) {
-          setPlaybackSettings(data.playbackSettings);
-        }
-        if (data.lastUpdated) {
-          lastSyncTimestampRef.current = data.lastUpdated;
+        const serverTs = data.lastUpdated || 0;
+
+        // Only update state if data has actually changed on the server.
+        if (serverTs !== lastSyncTimestampRef.current) {
+          lastSyncTimestampRef.current = serverTs;
+          if (data.folders && Array.isArray(data.folders)) {
+            setFolders(data.folders);
+          }
+          if (data.files && Array.isArray(data.files)) {
+            // Deduplicate to ensure locally uploaded files are never lost
+            setFiles((prev) => {
+              const serverFileMap = new Map<string, UploadedFile>(
+                data.files.map((f: UploadedFile) => [f.id, f])
+              );
+              // Include local files that may still be syncing
+              const merged = [...data.files];
+              for (const pf of prev) {
+                if (!serverFileMap.has(pf.id)) {
+                  merged.unshift(pf);
+                }
+              }
+              return merged;
+            });
+          }
+          if (data.playbackSettings && data.playbackSettings.voiceId) {
+            setPlaybackSettings(data.playbackSettings);
+          }
         }
         setSyncStatus('synced');
       } else {
@@ -180,8 +203,11 @@ export default function App() {
       fetchServerData(true);
     }, 6000);
 
-    // Refresh immediately when tab gains focus (e.g. mobile user opens phone)
+    // Refresh when tab gains focus, but avoid flashing when closing OS file pickers
     const handleFocus = () => {
+      if (isUploadingRef.current || Date.now() - lastUploadTimeRef.current < 2500) {
+        return;
+      }
       fetchServerData(true);
     };
 
@@ -452,21 +478,46 @@ export default function App() {
 
   // Add files: optimistic local update + server persistence
   const handleAddFiles = async (newFiles: UploadedFile[]) => {
-    setFiles((prev) => [...newFiles, ...prev]);
+    if (!newFiles || newFiles.length === 0) return;
+
+    isUploadingRef.current = true;
+    lastUploadTimeRef.current = Date.now();
+    setSyncStatus('syncing');
+
+    // Optimistically prepend unique files so UI updates instantly
+    setFiles((prev) => {
+      const existingIds = new Set(prev.map((f) => f.id));
+      const uniqueNew = newFiles.filter((f) => !existingIds.has(f.id));
+      return [...uniqueNew, ...prev];
+    });
+
+    // Automatically focus into the destination folder so user immediately sees their uploaded files in the folder
+    if (newFiles.length > 0 && newFiles[0].folderId) {
+      setActiveFolderId(newFiles[0].folderId);
+    }
 
     try {
-      setSyncStatus('syncing');
       const res = await fetch('/api/files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ newFiles }),
       });
       if (res.ok) {
+        const data = await res.json();
+        if (data.lastUpdated) {
+          lastSyncTimestampRef.current = data.lastUpdated;
+        }
         setSyncStatus('synced');
+      } else {
+        setSyncStatus('offline');
       }
     } catch (e) {
       console.error('Failed to upload files to server:', e);
       setSyncStatus('offline');
+    } finally {
+      setTimeout(() => {
+        isUploadingRef.current = false;
+      }, 500);
     }
   };
 
@@ -759,7 +810,7 @@ export default function App() {
                         key={folder.id}
                         folder={folder}
                         files={folderFiles}
-                        isSelected={false}
+                        isSelected={activeFolderId === folder.id}
                         onSelect={() => setActiveFolderId(folder.id)}
                         onPlayFolder={() => handlePlayFolder(folder.id)}
                         onOpenAiQuiz={() => setAiQuizFolder(folder)}
@@ -768,6 +819,12 @@ export default function App() {
                           setIsUploadOpen(true);
                         }}
                         onDeleteFolder={() => handleDeleteFolder(folder.id)}
+                        onPlayFile={(f) => handlePlayFile(f)}
+                        onViewFile={(f) => setViewingFile(f)}
+                        onDeleteFile={(id) => handleDeleteFile(id)}
+                        onAddDirectFiles={handleAddFiles}
+                        activeTrackFileId={activeTrack?.fileId}
+                        isPlaying={isPlaying}
                       />
                     );
                   })}
@@ -798,7 +855,10 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => setIsUploadOpen(true)}
+                      onClick={() => {
+                        setUploadFolderTargetId(activeFolderId || undefined);
+                        setIsUploadOpen(true);
+                      }}
                       className="px-2.5 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
                     >
                       <Plus className="w-3.5 h-3.5" />
@@ -891,7 +951,10 @@ export default function App() {
       {/* File Upload Modal */}
       <FileUploadModal
         isOpen={isUploadOpen}
-        onClose={() => setIsUploadOpen(false)}
+        onClose={() => {
+          setIsUploadOpen(false);
+          setUploadFolderTargetId(undefined);
+        }}
         folders={folders}
         initialFolderId={uploadFolderTargetId}
         onAddFiles={handleAddFiles}
