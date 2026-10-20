@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
+import { cleanMarkdownForSpeech } from './src/utils/cleanMarkdownForSpeech';
 
 dotenv.config();
 
@@ -288,7 +289,16 @@ app.post('/api/ai/tts', async (req, res) => {
       });
     }
 
-    const trimmedText = text.slice(0, 1500);
+    // Clean markdown formatting symbols (#, |, *, _, links, tables)
+    const cleanText = cleanMarkdownForSpeech(text).slice(0, 2000);
+
+    if (!cleanText || cleanText.trim().length === 0) {
+      return res.status(200).json({
+        fallback: true,
+        message: 'Text is empty after stripping markdown syntax; fallback to browser speech.',
+      });
+    }
+
     const validVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
     const chosenVoice = validVoices.includes(voiceName) ? voiceName : 'Kore';
 
@@ -299,7 +309,7 @@ app.post('/api/ai/tts', async (req, res) => {
           role: 'user',
           parts: [
             {
-              text: trimmedText,
+              text: `Read the following text aloud verbatim. Do not add any introductory or transitional words, commentary, or conversational filler:\n\n${cleanText}`,
               speechMetadata: {
                 style: 'Natural, articulate, engaging educational narrator',
               },

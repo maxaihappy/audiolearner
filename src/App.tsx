@@ -278,6 +278,10 @@ export default function App() {
     const item = queueRef.current[index];
     if (!item) return;
 
+    // Completely stop and unload previous audio & cancel any speech utterances
+    audioEngine.stop();
+    audioEngine.stopPreview();
+
     setCurrentQueueIndex(index);
     setCurrentTime(0);
     setProgress(0);
@@ -308,6 +312,8 @@ export default function App() {
   // 1. Play All Files
   const handlePlayAllFiles = () => {
     if (files.length === 0) return;
+    audioEngine.stop();
+    audioEngine.stopPreview();
     const newQueue: QueueItem[] = files.map(fileToQueueItem);
     setQueue(newQueue);
     setCurrentQueueIndex(0);
@@ -320,7 +326,8 @@ export default function App() {
   const handlePlayFolder = (folderId: string) => {
     const folderFiles = files.filter((f) => f.folderId === folderId);
     if (folderFiles.length === 0) return;
-
+    audioEngine.stop();
+    audioEngine.stopPreview();
     const newQueue: QueueItem[] = folderFiles.map(fileToQueueItem);
     setQueue(newQueue);
     setCurrentQueueIndex(0);
@@ -331,6 +338,9 @@ export default function App() {
 
   // 3. Play individual file
   const handlePlayFile = (file: UploadedFile) => {
+    // Immediately stop reading previous file
+    audioEngine.stop();
+    audioEngine.stopPreview();
     const item = fileToQueueItem(file);
     const newQueue = [item, ...queue.filter((q) => q.fileId !== file.id)];
     setQueue(newQueue);

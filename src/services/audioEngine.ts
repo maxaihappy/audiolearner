@@ -1,4 +1,5 @@
 import { VoiceEngine, VoiceOption } from '../types';
+import { cleanMarkdownForSpeech } from '../utils/cleanMarkdownForSpeech';
 
 export const GEMINI_VOICES: VoiceOption[] = [
   {
@@ -59,6 +60,7 @@ class AudioEngine {
   private onVoicesChangedCallbacks: (() => void)[] = [];
   private previewAudioElement: HTMLAudioElement | null = null;
   private previewRequestId: number = 0;
+  private currentSessionId: number = 0;
 
   // Listeners
   private onTimeUpdateCallback?: (currentTime: number, duration: number, progress: number) => void;
@@ -170,8 +172,15 @@ class AudioEngine {
   }
 
   // Play direct audio file (mp3, wav, etc.)
-  public async playAudioUrl(url: string, startingTime: number = 0) {
+  public async playAudioUrl(url: string, startingTime: number = 0, expectedSessionId?: number) {
+    if (expectedSessionId !== undefined && this.currentSessionId !== expectedSessionId) {
+      return;
+    }
+
     this.stop();
+    this.currentSessionId++;
+    const thisSession = this.currentSessionId;
+
     if (!this.audioElement) return;
 
     this.audioElement.src = url;
@@ -181,67 +190,98 @@ class AudioEngine {
 
     try {
       await this.audioElement.play();
-      this.isPlayingAudio = true;
-      this.notifyStateChange(true);
+      if (this.currentSessionId === thisSession) {
+        this.isPlayingAudio = true;
+        this.notifyStateChange(true);
+      } else {
+        this.audioElement.pause();
+      }
     } catch (e) {
-      console.error('Audio play failed:', e);
-      this.notifyStateChange(false);
+      if (this.currentSessionId === thisSession) {
+        console.error('Audio play failed:', e);
+        this.notifyStateChange(false);
+      }
     }
   }
 
   // Play text using current voice settings (Gemini Neural or Browser TTS)
   public async playText(text: string, estimatedDuration: number = 60) {
+    // 1. Immediately kill any current playing audio or browser speech
     this.stop();
 
-    if (!text || text.trim().length === 0) {
+    // 2. Assign unique session id for this playback request
+    this.currentSessionId++;
+    const thisSession = this.currentSessionId;
+
+    // 3. Clean markdown format characters (#, |, *, _, links, tables, code backticks)
+    const spokenText = cleanMarkdownForSpeech(text);
+
+    if (!spokenText || spokenText.trim().length === 0) {
       this.handleAudioEnded();
       return;
     }
 
-    // Split text into meaningful spoken chunks (paragraphs / sentences)
-    const rawChunks = text
-      .split(/(?<=[.?!;:\n])\s+/)
+    // 4. Split text into natural spoken sentences (only split on . ! ? or double newlines, NOT on : or ;)
+    // Colons and semicolons are natural breathing pauses within a sentence, splitting on them caused jarring restarts
+    const rawChunks = spokenText
+      .split(/(?<=[.?!])\s+|\n{2,}/)
       .map(s => s.trim())
       .filter(s => s.length > 0);
 
-    this.textChunks = rawChunks.length > 0 ? rawChunks : [text];
+    this.textChunks = rawChunks.length > 0 ? rawChunks : [spokenText];
     this.currentChunkIndex = 0;
 
     // Check if user selected Gemini Neural Voice
     if (this.activeVoiceEngine === 'gemini') {
       const voiceRawName = this.activeVoiceId.replace('gemini-', '');
-      // Try calling server Gemini TTS
       try {
         const response = await fetch('/api/ai/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            text: text.slice(0, 1500), // reasonable prompt size
+            text: spokenText.slice(0, 2000),
             voiceName: voiceRawName,
           }),
         });
 
+        // If user already clicked another file or stopped while fetching, abort immediately!
+        if (this.currentSessionId !== thisSession) {
+          return;
+        }
+
         const data = await response.json();
+        if (this.currentSessionId !== thisSession) {
+          return;
+        }
+
         if (data.success && data.audioBase64) {
           const wavUrl = `data:${data.mimeType || 'audio/wav'};base64,${data.audioBase64}`;
-          await this.playAudioUrl(wavUrl, 0);
+          await this.playAudioUrl(wavUrl, 0, thisSession);
           return;
         }
       } catch (err) {
+        if (this.currentSessionId !== thisSession) return;
         console.warn('Gemini TTS failed or offline, falling back to browser synthesis', err);
       }
     }
 
+    if (this.currentSessionId !== thisSession) return;
+
     // Fallback or explicit Browser SpeechSynthesis
-    this.playWithBrowserSpeech(this.textChunks, estimatedDuration);
+    this.playWithBrowserSpeech(this.textChunks, estimatedDuration, thisSession);
   }
 
-  private playWithBrowserSpeech(chunks: string[], estimatedTotalSecs: number) {
+  private playWithBrowserSpeech(chunks: string[], estimatedTotalSecs: number, sessionId: number) {
     if (!('speechSynthesis' in window)) {
       console.warn('Browser SpeechSynthesis not supported');
       return;
     }
 
+    if (this.currentSessionId !== sessionId) {
+      return;
+    }
+
+    // Cancel any previous utterances
     window.speechSynthesis.cancel();
     this.isSpeakingBrowser = true;
     this.notifyStateChange(true);
@@ -253,7 +293,12 @@ class AudioEngine {
     this.startProgressTicker(totalDuration, startTime);
 
     const speakChunk = (index: number) => {
-      if (index >= chunks.length || !this.isSpeakingBrowser) {
+      // Abort if session changed, or stopped
+      if (this.currentSessionId !== sessionId || !this.isSpeakingBrowser) {
+        return;
+      }
+
+      if (index >= chunks.length) {
         this.stopProgressTicker();
         this.isSpeakingBrowser = false;
         this.notifyStateChange(false);
@@ -264,7 +309,7 @@ class AudioEngine {
       this.currentChunkIndex = index;
       const currentSentence = chunks[index];
 
-      if (this.onSentenceChangeCallback) {
+      if (this.onSentenceChangeCallback && this.currentSessionId === sessionId) {
         this.onSentenceChangeCallback(currentSentence, index, chunks.length);
       }
 
@@ -286,22 +331,36 @@ class AudioEngine {
       }
 
       utterance.onend = () => {
-        if (this.isSpeakingBrowser) {
+        if (this.currentSessionId === sessionId && this.isSpeakingBrowser) {
           speakChunk(index + 1);
         }
       };
 
       utterance.onerror = (e) => {
-        console.warn('SpeechSynthesis error:', e);
-        if (this.isSpeakingBrowser) {
-          speakChunk(index + 1);
+        // If canceled or interrupted by user starting a new file or stopping, do NOT continue speaking!
+        if (
+          e.error === 'canceled' ||
+          e.error === 'interrupted' ||
+          this.currentSessionId !== sessionId ||
+          !this.isSpeakingBrowser
+        ) {
+          return;
         }
+        console.warn('SpeechSynthesis error:', e);
+        speakChunk(index + 1);
       };
 
-      window.speechSynthesis.speak(utterance);
+      if (this.currentSessionId === sessionId && this.isSpeakingBrowser) {
+        window.speechSynthesis.speak(utterance);
+      }
     };
 
-    speakChunk(0);
+    // Small timeout ensures browser speech engine has processed previous cancel()
+    setTimeout(() => {
+      if (this.currentSessionId === sessionId && this.isSpeakingBrowser) {
+        speakChunk(0);
+      }
+    }, 40);
   }
 
   private startProgressTicker(totalDuration: number, startTime: number) {
@@ -351,15 +410,26 @@ class AudioEngine {
   }
 
   public stop() {
+    this.currentSessionId++;
     this.stopProgressTicker();
     if (this.audioElement) {
-      this.audioElement.pause();
-      this.audioElement.currentTime = 0;
+      try {
+        this.audioElement.pause();
+        this.audioElement.currentTime = 0;
+        this.audioElement.removeAttribute('src');
+        this.audioElement.load();
+      } catch (e) {
+        console.warn('Error unloading audio element', e);
+      }
     }
     this.isPlayingAudio = false;
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn('Error cancelling speech synthesis', e);
+      }
     }
     this.isSpeakingBrowser = false;
     this.currentUtterance = null;
